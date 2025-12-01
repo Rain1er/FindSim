@@ -1,6 +1,6 @@
 """
 FindSim - 网站指纹识别工具
-提取网站特征并使用DeepSeek AI分析识别指纹
+提取网站特征并使用LLM分析识别指纹
 """
 
 import os
@@ -11,9 +11,10 @@ from deepseek_analyzer import DeepSeekAnalyzer
 import warnings
 import json
 import base64
-import requests
+import httpx
 import logging
-from typing import Dict
+from typing import Dict, List
+from urllib.parse import urlparse
 
 from url_list_similarity import UrlListSimilarity
 
@@ -25,6 +26,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def load_urls_from_stdin() -> List[str]:
+    """
+    从标准输入读取URL列表
+    支持管道输入，如: cat urls.txt | python main.py
+    或者: echo "https://example.com" | python main.py
+        
+    Returns:
+        URL列表
+    """
+    urls = []
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            # 跳过空行和注释行
+            if line and not line.startswith('#'):
+                # 验证URL格式
+                if line.startswith(('http://', 'https://')):
+                    urls.append(line)
+                else:
+                    logger.warning(f"跳过无效URL: {line}")
+    except Exception as e:
+        logger.error(f"从标准输入读取URL失败: {e}")
+    return urls
+
+
+def get_fingerprints_sum(fingerprints: List[str]) -> List[str]:
+    """
+    从fingerprints列表中提取文件名，并与原始指纹合并
+    
+    Args:
+        fingerprints: 指纹路径列表
+        
+    Returns:
+        原始指纹 + 文件名列表（去重，排除单层路径）
+    
+    Note:
+        list(fingerprints) 是浅拷贝，创建了新的列表对象。
+        由于列表元素是字符串（不可变对象），新旧列表中的字符串元素指向相同内存。
+        但后续 append 的新元素只会添加到 result 中，不影响原 fingerprints 列表。
+    """
+    result = list(fingerprints)  # 浅拷贝：新列表对象，但字符串元素共享内存
+    for fp in fingerprints:
+        # 提取路径中的文件名
+        filename = os.path.basename(fp)
+        # 只有当路径包含多层目录时才添加文件名（避免/finger.html -> finger.html的情况）
+        if filename and filename not in result and fp != f"/{filename}":
+            result.append(filename)  # 新添加的元素只存在于 result 中
+    return result
+
 def load_config():
     """加载配置文件"""
     config_file = 'config.json'
@@ -33,25 +84,37 @@ def load_config():
         with open(config_file, 'r', encoding='utf-8') as f:
             return json.load(f)
     else:
-        logger.error("❌ 错误: 读取配置文件失败，请检查config.json")
+        logger.error("错误: 读取配置文件失败，请检查config.json")
         sys.exit(1)
         
 
 
-def save_results(url: str, features: dict, analysis: dict, output_file: str = None):
-    """保存分析结果到文件"""
+def save_results(url: str, features: dict, analysis: dict, valid_results: List[Dict] = None, output_file: str = None):
+    """
+    保存分析结果到文件
+    
+    Args:
+        url: 目标URL
+        features: 网站特征
+        analysis: AI分析结果
+        valid_results: 有效指纹验证结果列表
+        output_file: 输出文件路径
+    """
+    fingerprints = analysis.get('fingerprints', [])
+    
     result = {
         'url': url,
         'favicon_hash': analysis.get('favicon_hash', features.get('favicon_hash', '')),
-        'fingerprints': analysis.get('fingerprints', []),
-        'raw_features': features
+        'resources': features.get('resources', {}),
+        'fingerprints': fingerprints,
+        'fingerprints_sum': get_fingerprints_sum(fingerprints),
+        'results': valid_results if valid_results else []
     }
     
     if not output_file:
         # 生成默认文件名
-        from urllib.parse import urlparse
-        domain = urlparse(url).netloc.replace('.', '_')
-        output_file = f"fingerprint_{domain}.json"
+        domain = urlparse(url).netloc.replace('.', '_').replace(':', '-')
+        output_file = f"./results/fingerprint_{domain}.json"
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
@@ -67,7 +130,8 @@ def print_features_summary(features: dict):
     logger.info("网站资源提取结果")
     logger.info("="*80)
     logger.info(f"URL: {features['url']}")
-    logger.info(f"Favicon Hash (mmh3): {features['favicon_hash']}")
+    if features['favicon_hash']:
+        logger.info(f"Favicon Hash (mmh3): {features['favicon_hash']}")
     logger.info(f"src数量为: {len(resources.get('all_srcs', []))} 个")
     logger.info(f"href数量为: {len(resources.get('all_hrefs', []))} 个")
     
@@ -78,121 +142,153 @@ def main():
     """主函数"""
     global analyzer, config
     parser = argparse.ArgumentParser(
-        description='FindSim - FOFA指纹提取工具\n提取网站资源，通过DeepSeek AI排除通用组件，输出可用于FOFA检索的指纹',
+        description='FindSim - FOFA指纹提取工具\n提取网站资源，通过LLM排除通用组件，输出可用于FOFA检索的指纹',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
   python main.py -u https://example.com
-  python main.py -u https://example.com -o fingerprint.json
   python main.py -u https://example.com --no-analysis
+  echo "https://example.com" | python main.py
         """
     )
     
-    parser.add_argument('-u', '--url', required=True, help='要分析的网站URL')
+    parser.add_argument('-u', '--url', help='要分析的网站URL (不指定时从标准输入读取)')
     parser.add_argument('-o', '--output', help='输出文件路径 (可选)')
     parser.add_argument('--no-analysis', action='store_true', help='只提取特征,不进行AI分析')
     parser.add_argument('-t', '--timeout', type=int, default=10, help='请求超时时间(秒), 默认10秒')
     
     args = parser.parse_args()
     
-    # 验证URL
-    if not args.url.startswith(('http://', 'https://')):
-        logger.error("ERROR: URL必须以 http:// 或 https:// 开头")
-        sys.exit(1)
+    # 获取URL列表
+    urls = []
+    if args.url:
+        # 验证单个URL
+        if not args.url.startswith(('http://', 'https://')):
+            logger.error("ERROR: URL必须以 http:// 或 https:// 开头")
+            sys.exit(1)
+        urls = [args.url]
+    else:
+        # 从标准输入读取URL列表
+        if sys.stdin.isatty():
+            logger.error("ERROR: 请通过 -u 参数指定URL，或通过管道传入URL列表")
+            logger.info("示例: echo 'https://example.com' | python main.py")
+            logger.info("示例: cat urls.txt | python main.py")
+            sys.exit(1)
+        urls = load_urls_from_stdin()
+        if not urls:
+            logger.error("ERROR: 未从标准输入读取到有效URL")
+            sys.exit(1)
+        logger.info(f"从标准输入读取到 {len(urls)} 个URL")
     
-    logger.info(f"\n开始分析网站: {args.url}")
+    # 加载配置
+    config = load_config()
+    
+    # 初始化分析器
+    analyzer = None
+    if not args.no_analysis:
+        analyzer = DeepSeekAnalyzer(config['deepseek_api_key'])
+    
+    # 遍历处理每个URL
+    for url in urls:
+        process_single_url(url, args, config, analyzer)
+
+
+def process_single_url(url: str, args, config: dict, analyzer):
+    """
+    处理单个URL的分析流程
+    
+    Args:
+        url: 要分析的URL
+        args: 命令行参数
+        config: 配置信息
+        analyzer: DeepSeek分析器实例
+    """
+    logger.info(f"\n开始分析网站: {url}")
     logger.info("="*80)
     
     # 步骤1: 提取网站特征
     logger.info("\n步骤 1/2: 提取网站特征...")
     try:
-        extractor = WebsiteFeatureExtractor(args.url, timeout=args.timeout)
+        extractor = WebsiteFeatureExtractor(url, timeout=args.timeout, enable_favicon=True)
         features = extractor.extract_all_features()
         print_features_summary(features)
     except Exception as e:
-        logger.error(f"❌ 提取特征失败: {e}")
-        sys.exit(1)
+        logger.error(f"提取特征失败: {e}")
+        return
     
-    analysis_result: Dict   # LLM 提取的特征
+    analysis_result: Dict = {}   # LLM 提取的特征
     
-    # 步骤2: DeepSeek AI分析
-    if not args.no_analysis:
-        logger.info("\n步骤 2/2: DeepSeek AI排除通用组件...")
+    # 步骤2: LLM分析
+    if analyzer:
+        logger.info("\n步骤 2/2: LLM排除通用组件...")
         try:
-            config = load_config()
-            analyzer = DeepSeekAnalyzer(config['deepseek_api_key'])
             analysis_result = analyzer.analyze_features(features)
-            # analyzer.print_analysis(analysis_result)
         except Exception as e:
-            logger.error(f"❌ AI分析失败: {e}")
+            logger.error(f"AI分析失败: {e}")
             logger.error("特征提取已完成,但AI分析失败")
             analysis_result = {'success': False, 'error': str(e)}
     else:
         logger.warning("\n跳过AI分析 (--no-analysis)")
         analysis_result = {}
     
-    # 保存结果
-    if analysis_result and analysis_result.get('success'):
-        save_results(args.url, features, analysis_result, args.output)
-    elif args.output:
-        # 即使没有AI分析也保存原始特征
-        with open(args.output, 'w', encoding='utf-8') as f:
-            json.dump(features, f, ensure_ascii=False, indent=2)
-    #     logger.info(f"\n原始特征已保存到: {args.output}")
-    #
-    # logger.info("\n分析完成!")
+    # 如果AI分析失败或跳过，直接返回
+    if not analysis_result or not analysis_result.get('success'):
+        if args.output:
+            # 即使没有AI分析也保存原始特征
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump(features, f, ensure_ascii=False, indent=2)
+        return
 
     # 将之前LLM返回的指纹放到fofa里面请求
 
     # 存储最终结果的字典
     final_results: Dict = {}
     final_results_count: Dict = {}  # 记录当前指纹对应的查询结果数量
+    
+    # 存储有效指纹结果
+    valid_fingerprint_results: List[Dict] = []
 
-    # 如果处理图标
-    # if features['favicon_hash']:
-    #     logger.info("=" * 80)   # 分割线
-    #     fofa_api: str = config["fofa_api"]
-    #     fofa_api_key: str = config["fofa_api_key"]
-    #     query: str = f"icon_hash=\"{features['favicon_hash']}\""
-    #     query_base64: str = base64.b64encode(query.encode()).decode()
-    #
-    #     api_url: str = f"{fofa_api}?key={fofa_api_key}&size=10000&qbase64={query_base64}"
-    #     try:
-    #         resp = requests.get(api_url, timeout=60)
-    #         resp.raise_for_status()
-    #         # remaining_queries = resp.json().get("remaining_queries", [])
-    #         # if remaining_queries <= 0:
-    #         #     logger.error("API查询次数已用完，退出程序")
-    #         #     sys.exit(0)
-    #
-    #         if resp.json().get("results"):
-    #             data: list = resp.json().get("results", [])
-    #             if len(data) > 10000:
-    #                 logger.info(f"查询结果数为{len(data)}>=10000条，指纹未命中")
-    #             else:
-    #                 logger.warning(f"当前指纹查询结果条数为: {len(data)},可能指纹命中")
-    #                 logger.warning(f"FOFA查询语句为：{query}")
-    #
-    #                 # 取前10条进行判断，只要指纹相似度大于80%的就认为是相似网站（后面提供手动调整阈值的方式）
-    #                 for _ in range(min(len(data), 10)):
-    #                     # 处理特殊情况，data[_][0]可能是完整的url
-    #                     if data[_][0].startswith("http") or data[_][0].startswith("https"):
-    #                         logger.info(f"{data[_][0]}")
-    #                     else:
-    #                         logger.info(f"{data[_][5]}://{data[_][0]}")
-    #         else:
-    #             logger.info(f"没有找到相关数据")
-    #     except requests.exceptions.RequestException as e:
-    #         logger.error(f"请求 fofa_api 时发生错误: {e}")
-    #
-    #     logger.info("="*80)
+    # 处理favicon指纹
+    if features['favicon_hash']:
+        logger.info("=" * 80)   # 分割线
+        fofa_api: str = config["fofa_api"]
+        fofa_api_key: str = config["fofa_api_key"]
+        query: str = f"icon_hash=\"{features['favicon_hash']}\""
+        query_base64: str = base64.b64encode(query.encode()).decode()
+    
+        api_url: str = f"{fofa_api}?key={fofa_api_key}&size=10000&qbase64={query_base64}"
+        try:
+            resp = httpx.get(api_url, timeout=60)   # TODO 设置一个全局变量，对FOFA api调用次数进行计数
+            resp.raise_for_status()
+            if resp.json().get("results"):
+                data: list = resp.json().get("results", [])
+                if len(data) > 10000:
+                    logger.info(f"favicon查询结果数为{len(data)}>=10000条，指纹未命中")
+                else:
+                    logger.warning(f"favicon查询结果条数为: {len(data)},可能指纹命中")
+                    logger.warning(f"FOFA查询语句为: {query}")
+    
+                    # 取前10条进行判断，只要指纹相似度大于80%的就认为是相似网站（后面提供手动调整阈值的方式）
+                    for _ in range(min(len(data), 10)):
+                        # 处理特殊情况，data[_][0]可能是完整的url
+                        if data[_][0].startswith("http"):
+                            logger.info(f"{data[_][0]}")
+                        else:
+                            logger.info(f"{data[_][5]}://{data[_][0]}")
+            else:
+                logger.info(f"favicon查询没有找到相关数据")
+        except httpx.RequestError as e:
+            logger.error(f"请求 fofa_api 时发生错误: {e}")
+    
+        logger.info("="*80)
 
 
     # 处理body中的指纹，遍历
-    for i in range(len(analysis_result['fingerprints'])):
+    fingerprints = get_fingerprints_sum(analysis_result.get('fingerprints', []))
+    for i in range(len(fingerprints)):
         logger.info("=" * 80)
-        finger: str = analysis_result['fingerprints'][i]    # [ "/js/userlogin.js", ...]
-        logger.info(f"当前查询指纹为：{finger}")
+        finger: str = fingerprints[i]    # [ "/js/userlogin.js", ...]
+        logger.info(f"当前查询指纹为: {finger}")
 
         # TODO 后面将这一部分进行封装到fofa_search类
         fofa_api: str = config["fofa_api"]
@@ -203,7 +299,7 @@ def main():
 
         api_url: str = f"{fofa_api}?key={fofa_api_key}&size=10000&qbase64={query_base64}"
         try:
-            resp = requests.get(api_url, timeout=60)
+            resp = httpx.get(api_url, timeout=60)
             resp.raise_for_status()
             # 针对单个指纹的处理，先判断该指纹检索出的数量
             if resp.json().get("results"):
@@ -212,30 +308,28 @@ def main():
                     logger.info(f"查询结果数为{len(data)}>=5000条，指纹未命中")
                 else:
                     logger.warning(f"查询结果数量为: {len(data)},指纹命中")
-                    logger.warning(f"FOFA查询语句为：{query}")
+                    logger.warning(f"FOFA查询语句为: {query}")
 
                     # 取前10条进行判断，只要指纹相似度大于80%的就认为是相似网站（后面提供手动调整阈值的方式）
 
                     # 首先获得url列表字典，key为指纹，value为url列表
-                    final_results[finger]: list = []
-                    final_results_count[finger]: list = []
+                    final_results[finger] = []
+                    final_results_count[finger] = 0
 
                     for _ in range(min(len(data), 10)):
                         if not data[_][0].startswith("0"):   # 处理特殊情况，可能查出IP地址为这个0.0.0.0
                             # 处理特殊情况，data[_][0]可能是完整的url,https也是http开头
                             if data[_][0].startswith("http"):
-                                # logger.info(f"{data[_][0]}")
-                                url: str = data[_][0]
+                                target_url: str = data[_][0]
                             else:
-                                # logger.info(f"{data[_][5]}://{data[_][0]}")
-                                url: str = f"{data[_][5]}://{data[_][0]}"
+                                target_url: str = f"{data[_][5]}://{data[_][0]}"
 
-                            final_results[finger].append(url)    # 例如{"/js/safe/LoginSafe.js": ["http://202.114.234.188", ...]}
+                            final_results[finger].append(target_url)    # 例如{"/js/safe/LoginSafe.js": ["http://202.114.234.188", ...]}
                             final_results_count[finger] = len(data)
 
             else:
                 logger.info(f"没有找到相关数据")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             logger.error(f"请求 fofa_api 时发生错误: {e}")
     logger.info("=" * 80)
 
@@ -249,43 +343,42 @@ def main():
 
     # 打印final_results字典
     logger.info(f"\n指纹查询总结:找到的候选指纹条数为:{len(final_results)}")
-    for finger, urls in final_results.items():  # 遍历字典用items()函数
-        jac_list: list = [] # 相似度列表
+    for finger, target_urls in final_results.items():  # 遍历字典用items()函数
+        sim_list: list = [] # 相似度列表
         logger.info(f"指纹: {finger} 命中URL数量: {final_results_count[finger]}")
-        for url in urls:
-            # logger.info(f"  - {url}")
-
+        for target_url in target_urls:
             # 请求final_results中的url，使用feature_extractor和deepseek_analyzer进行特征提取，验证指纹有效性。
             logger.info("\n开始验证指纹有效性...")
             try:
-                seccond_extractor = WebsiteFeatureExtractor(url, timeout=10)
-                seccond_features: Dict = seccond_extractor.extract_all_features()
-                seccond_analysis_result: Dict = analyzer.analyze_features(seccond_features)
+                second_extractor = WebsiteFeatureExtractor(target_url, timeout=10, enable_favicon=False)
+                second_features: Dict = second_extractor.extract_all_features()
+                second_analysis_result: Dict = analyzer.analyze_features(second_features)
 
                 # 比较两个列表的相似度
-                # logger.info("开始比较指纹相似度...")
-                # logger.info(f"原始指纹特征: {analysis_result['fingerprints']}")
-                # logger.info(f"对比指纹特征: {seccond_analysis_result['fingerprints']}")
+                sim: float = UrlListSimilarity.jaccard(analysis_result['fingerprints'], second_analysis_result.get('fingerprints', []))
+                sim_list.append(sim)            # 上一个版本的写法有问题，如果10个中有8个相似度为0，这里会出问题
 
-                jac: float = UrlListSimilarity.jaccard(analysis_result['fingerprints'], seccond_analysis_result['fingerprints'])
-                if jac > 0: # 避免获取失败的情况
-                    jac_list.append(jac)
             except Exception as e:
-                logger.error(f"❌ 提取特征失败: {e}")
-                sys.exit(1)
-            # 将列表中的相似度进行平均
-        if len(jac_list):
-            avg_jac: float = sum(jac_list) / len(jac_list)
-            if avg_jac >= 0.5:
-                logger.warning(f"[*] 指纹: {finger} 有效，平均相似度: {avg_jac:.2f}")
-                # 写到结果文件中
-                with open("valid_fingerprints.txt", "a", encoding="utf-8") as f:
-                    f.write(f"指纹: {finger} 平均相似度: {avg_jac:.2f} 命中URL数量: {final_results_count[finger]}\n")
+                logger.error(f"提取特征失败: {e}")
+                continue
+        
+        # 将列表中的相似度进行平均
+        if len(sim_list):
+            avg_sim_list: float = sum(sim_list) / len(sim_list)
+            if avg_sim_list >= 0.5:
+                logger.warning(f"[*] 指纹: {finger} 有效，平均相似度: {avg_sim_list:.2f}")
+                # 记录有效指纹结果
+                valid_fingerprint_results.append({
+                    'finger': finger,
+                    'avg_similar': f"{avg_sim_list:.2f}",
+                    'url_count': final_results_count[finger]
+                })
             else:
-                logger.warning(f"[-] 指纹: {finger} 无效，平均相似度: {avg_jac:.2f}")
-    # 插入分割线
-    with open("valid_fingerprints.txt", "a", encoding="utf-8") as f:
-            f.write("="*40 + "\n")
+                logger.warning(f"[-] 指纹: {finger} 无效，平均相似度: {avg_sim_list:.2f}")
+    
+    # 保存结果到JSON文件
+    save_results(url, features, analysis_result, valid_fingerprint_results, args.output)
+
 
 if __name__ == "__main__":
     main()

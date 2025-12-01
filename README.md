@@ -21,3 +21,9 @@ mv config_example.json config.json
 # go
 uv python main.py -u https://example.com
 ```
+
+3. 进阶  
+```bash
+cat tmp.txt | httpx -silent | uv run python main.py
+```
+

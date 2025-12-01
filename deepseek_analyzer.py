@@ -194,15 +194,15 @@ class DeepSeekAnalyzer:
         print("="*80)
         
         if result.get('success'):
-            print(f"\n📌 Favicon Hash (mmh3): {result.get('favicon_hash', 'N/A')}")
+            print(f"\nFavicon Hash (mmh3): {result.get('favicon_hash', 'N/A')}")
             
             fingerprints = result.get('fingerprints', [])
             if fingerprints:
-                print(f"\n🎯 可用于FOFA检索的指纹特征 ({len(fingerprints)}个):")
+                print(f"\n可用于FOFA检索的指纹特征 ({len(fingerprints)}个):")
                 for i, fp in enumerate(fingerprints, 1):
                     print(f"  {i}. {fp}")
                 
-                print("\n💡 FOFA检索语法示例:")
+                print("\nFOFA检索语法示例:")
                 if result.get('favicon_hash') and result['favicon_hash'] != '未找到favicon':
                     print(f'  icon_hash="{result["favicon_hash"]}"')
                 if fingerprints:
@@ -210,11 +210,11 @@ class DeepSeekAnalyzer:
                     if len(fingerprints) > 1:
                         print(f'  body="{fingerprints[0]}" && body="{fingerprints[1]}"')
             else:
-                print("\n⚠️  未识别到特征指纹(全部为通用组件)")
+                print("\n未识别到特征指纹(全部为通用组件)")
             
             print("\n" + "-"*80)
             print(f"Token使用: {result.get('usage', {})}")
         else:
-            print(f"\n❌ 分析失败: {result.get('error')}")
+            print(f"\n分析失败: {result.get('error')}")
         
         print("="*80 + "\n")

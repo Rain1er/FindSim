@@ -3,7 +3,7 @@
 提取图标MD5、src、href等关键资源
 """
 
-import requests
+import httpx
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List
 import logging
@@ -22,20 +22,29 @@ logger = logging.getLogger(__name__)
 class WebsiteFeatureExtractor:
     """网站特征提取器"""
     
-    def __init__(self, url: str, timeout: int = 10):
+    def __init__(self, url: str, timeout: int = 10, enable_favicon: bool = True):
+        """
+        初始化特征提取器
+        
+        Args:
+            url: 目标网站URL
+            timeout: 请求超时时间
+            enable_favicon: 是否启用favicon hash提取
+        """
         self.url = url
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        self.enable_favicon = enable_favicon
+        self.client = httpx.Client(
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            verify=False,
+            timeout=timeout
+        )
     
     def extract_all_features(self) -> Dict:
         """提取网站关键特征"""
         features = {
             'url': self.url,
-            # 'favicon_hash': self.get_favicon_hash(),
-            'favicon_hash': "",
+            'favicon_hash': self.get_favicon_hash() if self.enable_favicon else "",
             'resources': self.extract_resources()
         }
         return features
@@ -47,7 +56,7 @@ class WebsiteFeatureExtractor:
 
             # 尝试从HTML中获取favicon链接
             try:
-                response = self.session.get(self.url, timeout=self.timeout, verify=False)
+                response = self.client.get(self.url)
                 html_content = response.text
 
                 # 使用正则提取icon相关的link标签
@@ -69,7 +78,7 @@ class WebsiteFeatureExtractor:
             for path in favicon_paths:
                 favicon_url = urljoin(self.url, path)
                 try:
-                    response = self.session.get(favicon_url, timeout=self.timeout, verify=False)
+                    response = self.client.get(favicon_url)
                     if response.status_code == 200:
                         # 使用 mmh3.hash(base64.encodebytes(content)) 计算哈希，这是FOFA的算法
                         favicon_content = response.content
@@ -81,15 +90,15 @@ class WebsiteFeatureExtractor:
                 except Exception as e:
                     continue
 
-            return "未找到favicon"
+            return ""
         except Exception as e:
             logger.error(f"获取favicon hash失败: {e}")
-            return f"错误: {str(e)}"
+            return ""
     
     def extract_resources(self) -> Dict[str, List[str]]:
         """使用正则表达式提取网页中的所有资源(src和href)"""
         try:
-            response = self.session.get(self.url, timeout=self.timeout, verify=False)
+            response = self.client.get(self.url)
             html_content = response.text
             
             resources = {

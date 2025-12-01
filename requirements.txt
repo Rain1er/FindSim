@@ -1,4 +1,4 @@
-requests>=2.31.0
+httpx>=0.25.0
 openai>=1.0.0
 urllib3>=2.0.0
 mmh3>=4.0.0
