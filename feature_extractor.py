@@ -37,6 +37,7 @@ class WebsiteFeatureExtractor:
         self.client = httpx.Client(
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
             verify=False,
+            follow_redirects=True,
             timeout=timeout
         )
     
@@ -147,6 +148,9 @@ class WebsiteFeatureExtractor:
         
         for match in re.finditer(pattern, html_content, re.IGNORECASE):
             value = match.group(1)
+            # 去除查询参数
+            if '?' in value:
+                value = value.split('?', 1)[0]
             # 过滤掉特殊协议
             if attr_name == 'src':
                 if not value.startswith(('data:', 'javascript:', 'about:', 'blob:')):

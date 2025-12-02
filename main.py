@@ -16,6 +16,7 @@ import logging
 from typing import Dict, List
 from urllib.parse import urlparse
 
+from fofa_search import FofaSearch
 from url_list_similarity import UrlListSimilarity
 
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -249,37 +250,16 @@ def process_single_url(url: str, args, config: dict, analyzer):
     valid_fingerprint_results: List[Dict] = []
 
     # 处理favicon指纹
+    # 指纹的逻辑是：只记录查询结果小于5000的
     if features['favicon_hash']:
         logger.info("=" * 80)   # 分割线
-        fofa_api: str = config["fofa_api"]
-        fofa_api_key: str = config["fofa_api_key"]
-        query: str = f"icon_hash=\"{features['favicon_hash']}\""
-        query_base64: str = base64.b64encode(query.encode()).decode()
-    
-        api_url: str = f"{fofa_api}?key={fofa_api_key}&size=10000&qbase64={query_base64}"
-        try:
-            resp = httpx.get(api_url, timeout=60)   # TODO 设置一个全局变量，对FOFA api调用次数进行计数
-            resp.raise_for_status()
-            if resp.json().get("results"):
-                data: list = resp.json().get("results", [])
-                if len(data) > 10000:
-                    logger.info(f"favicon查询结果数为{len(data)}>=10000条，指纹未命中")
-                else:
-                    logger.warning(f"favicon查询结果条数为: {len(data)},可能指纹命中")
-                    logger.warning(f"FOFA查询语句为: {query}")
-    
-                    # 取前10条进行判断，只要指纹相似度大于80%的就认为是相似网站（后面提供手动调整阈值的方式）
-                    for _ in range(min(len(data), 10)):
-                        # 处理特殊情况，data[_][0]可能是完整的url
-                        if data[_][0].startswith("http"):
-                            logger.info(f"{data[_][0]}")
-                        else:
-                            logger.info(f"{data[_][5]}://{data[_][0]}")
-            else:
-                logger.info(f"favicon查询没有找到相关数据")
-        except httpx.RequestError as e:
-            logger.error(f"请求 fofa_api 时发生错误: {e}")
-    
+        query_favicon: str = f"icon_hash=\"{features['favicon_hash']}\""
+        fofa_query_num = len(FofaSearch(config, query_favicon).fofa_query())
+        if fofa_query_num > 5000:
+            logger.info(f"favicon查询结果数为{fofa_query_num}>=5000，指纹未命中")
+        else:
+            logger.warning(f"favicon查询结果条数为: {fofa_query_num},可能指纹命中")
+            logger.warning(f"FOFA查询语句为: {query_favicon}")
         logger.info("="*80)
 
 
@@ -290,56 +270,36 @@ def process_single_url(url: str, args, config: dict, analyzer):
         finger: str = fingerprints[i]    # [ "/js/userlogin.js", ...]
         logger.info(f"当前查询指纹为: {finger}")
 
-        # TODO 后面将这一部分进行封装到fofa_search类
-        fofa_api: str = config["fofa_api"]
-        fofa_api_key: str = config["fofa_api_key"]
-
         query: str = f"body=\"{finger}\""
-        query_base64: str = base64.b64encode(query.encode()).decode()
+        fofa_search = FofaSearch(config, query)
+        fofa_search_res: list = fofa_search.fofa_query()
 
-        api_url: str = f"{fofa_api}?key={fofa_api_key}&size=10000&qbase64={query_base64}"
-        try:
-            resp = httpx.get(api_url, timeout=60)
-            resp.raise_for_status()
-            # 针对单个指纹的处理，先判断该指纹检索出的数量
-            if resp.json().get("results"):
-                data: list = resp.json().get("results", [])
-                if len(data) >= 5000:
-                    logger.info(f"查询结果数为{len(data)}>=5000条，指纹未命中")
-                else:
-                    logger.warning(f"查询结果数量为: {len(data)},指纹命中")
-                    logger.warning(f"FOFA查询语句为: {query}")
-
-                    # 取前10条进行判断，只要指纹相似度大于80%的就认为是相似网站（后面提供手动调整阈值的方式）
-
-                    # 首先获得url列表字典，key为指纹，value为url列表
-                    final_results[finger] = []
-                    final_results_count[finger] = 0
-
-                    for _ in range(min(len(data), 10)):
-                        if not data[_][0].startswith("0"):   # 处理特殊情况，可能查出IP地址为这个0.0.0.0
-                            # 处理特殊情况，data[_][0]可能是完整的url,https也是http开头
-                            if data[_][0].startswith("http"):
-                                target_url: str = data[_][0]
-                            else:
-                                target_url: str = f"{data[_][5]}://{data[_][0]}"
-
-                            final_results[finger].append(target_url)    # 例如{"/js/safe/LoginSafe.js": ["http://202.114.234.188", ...]}
-                            final_results_count[finger] = len(data)
-
+        # 针对单个指纹的处理，先判断该指纹检索出的数量
+        if fofa_search_res:
+            if len(fofa_search_res) >= 5000:
+                logger.info(f"查询结果数为{len(fofa_search_res)}>=5000条，指纹未命中")
             else:
-                logger.info(f"没有找到相关数据")
-        except httpx.RequestError as e:
-            logger.error(f"请求 fofa_api 时发生错误: {e}")
-    logger.info("=" * 80)
+                logger.warning(f"查询结果数量为: {len(fofa_search_res)},指纹命中")
+                logger.warning(f"FOFA查询语句为: {query}")
+
+                # 取前10条进行判断，只要指纹相似度大于某个值的就认为是相似网站（后面提供手动调整阈值的方式）
+
+                # 首先获得url列表字典，key为指纹，value为url列表
+                final_results[finger] = []
+                final_results_count[finger] = 0
+
+                for _ in range(min(len(fofa_search_res), 10)):
+                    target_url: str = fofa_search_res[_][4]  # 拿到link字段
+                    final_results[finger].append(target_url)  # 例如{"/js/safe/LoginSafe.js": ["http://202.114.234.188", ...]}
+                    final_results_count[finger] = len(fofa_search_res)
+        logger.info("=" * 80)
 
     # 现在需要就当前指纹进行相似度对比，如果相似度符合，则认为该条指纹有效
 
     # 将final_results_count进行排序，按命中数量从小到大，同时保持final_results同步排序
     sorted_fingers = sorted(final_results_count.items(), key=lambda x: x[1])
     final_results_count = {k: v for k, v in sorted_fingers}
-    final_results = {k: final_results[k] for k in final_results_count.keys()
-                        if k in final_results}
+    final_results = {k: final_results[k] for k in final_results_count.keys() if k in final_results}
 
     # 打印final_results字典
     logger.info(f"\n指纹查询总结:找到的候选指纹条数为:{len(final_results)}")
@@ -356,7 +316,8 @@ def process_single_url(url: str, args, config: dict, analyzer):
 
                 # 比较两个列表的相似度
                 sim: float = UrlListSimilarity.jaccard(analysis_result['fingerprints'], second_analysis_result.get('fingerprints', []))
-                sim_list.append(sim)            # 上一个版本的写法有问题，如果10个中有8个相似度为0，这里会出问题
+                if sim > 0.1:    # 这里由于存在无关网站的干扰，所以设置一个最低阈值，低于这个值的相似度不进行记录
+                    sim_list.append(sim)
 
             except Exception as e:
                 logger.error(f"提取特征失败: {e}")
@@ -365,7 +326,7 @@ def process_single_url(url: str, args, config: dict, analyzer):
         # 将列表中的相似度进行平均
         if len(sim_list):
             avg_sim_list: float = sum(sim_list) / len(sim_list)
-            if avg_sim_list >= 0.5:
+            if avg_sim_list >= 0.4:
                 logger.warning(f"[*] 指纹: {finger} 有效，平均相似度: {avg_sim_list:.2f}")
                 # 记录有效指纹结果
                 valid_fingerprint_results.append({
