@@ -10,6 +10,8 @@
 uv venv --python 3.12
 # 安装项目中的uv pip
 uv pip install pip
+# 安装依赖
+uv pip install -r requirements.txt
 # 在当前终端中激活虚拟环境
 source .venv/bin/activate
 ```
